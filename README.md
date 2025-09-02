@@ -1,0 +1,298 @@
+# Boilerplate: Next.js + Prisma + NextAuth + Stripe
+
+This single-file boilerplate contains essential files for a minimal SaaS using Next.js (App Router can be migrated), TypeScript, Prisma (Postgres), NextAuth, and Stripe subscriptions.
+
+--- FILE: package.json
+```json
+{
+  "name": "lovable-saas",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "seed": "ts-node --transpile-only prisma/seed.ts"
+  },
+  "dependencies": {
+    "next": "14.0.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "next-auth": "^5.0.0",
+    "@prisma/client": "^5.0.0",
+    "prisma": "^5.0.0",
+    "stripe": "^12.0.0",
+    "zod": "^3.0.0",
+    "bcryptjs": "^2.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.0.0"
+  }
+}
+```
+
+--- FILE: .env.example
+```
+DATABASE_URL=postgresql://USER:PASS@HOST:PORT/DB?schema=public
+NEXTAUTH_SECRET=change_this_to_a_random_value
+NEXTAUTH_URL=http://localhost:3000
+# NextAuth provider (example: Google)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+# Stripe
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+# App
+NEXT_PUBLIC_STRIPE_PK=pk_test_...
+```
+
+--- FILE: prisma/schema.prisma
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  name      String
+  stripeCustomerId String?
+  createdAt DateTime @default(now())
+  users     User[]
+  projects  Project[]
+  subscriptions Subscription[]
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  emailVerified DateTime?
+  passwordHash  String?
+  role          String   @default("user")
+  tenant        Tenant?  @relation(fields: [tenantId], references: [id])
+  tenantId      String?
+  createdAt     DateTime @default(now())
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  tenantId  String
+  name      String
+  slug      String   @unique
+  config    Json?
+  createdAt DateTime @default(now())
+}
+
+model Subscription {
+  id String @id @default(cuid())
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  tenantId String
+  stripeSubscriptionId String @unique
+  status String
+  currentPeriodEnd DateTime?
+  createdAt DateTime @default(now())
+}
+```
+
+--- FILE: src/lib/prisma.ts
+```ts
+import { PrismaClient } from '@prisma/client'
+
+declare global {
+  // eslint-disable-next-line no-var
+  var prisma: PrismaClient | undefined
+}
+
+export const prisma = global.prisma || new PrismaClient()
+if (process.env.NODE_ENV !== 'production') global.prisma = prisma
+```
+
+--- FILE: src/lib/stripe.ts
+```ts
+import Stripe from 'stripe'
+
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
+  apiVersion: '2024-11-01'
+})
+```
+
+--- FILE: src/pages/api/auth/[...nextauth].ts
+```ts
+import NextAuth from 'next-auth'
+import GoogleProvider from 'next-auth/providers/google'
+import CredentialsProvider from 'next-auth/providers/credentials'
+import { prisma } from '../../../lib/prisma'
+import { compare } from 'bcryptjs'
+
+export default NextAuth({
+  secret: process.env.NEXTAUTH_SECRET,
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID || '',
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || ''
+    }),
+    CredentialsProvider({
+      id: 'credentials',
+      name: 'Credentials',
+      credentials: {
+        email: { label: 'Email', type: 'text' },
+        password: { label: 'Password', type: 'password' }
+      },
+      async authorize(credentials) {
+        if (!credentials) return null
+        const user = await prisma.user.findUnique({ where: { email: credentials.email } })
+        if (!user || !user.passwordHash) return null
+        const isValid = await compare(credentials.password, user.passwordHash)
+        if (!isValid) return null
+        return { id: user.id, email: user.email, name: user.name }
+      }
+    })
+  ],
+  callbacks: {
+    async session({ session, user }) {
+      // attach additional info if needed
+      return session
+    }
+  },
+  pages: {
+    signIn: '/auth/signin'
+  }
+})
+```
+
+--- FILE: src/pages/api/stripe/webhook.ts
+```ts
+import { buffer } from 'micro'
+import type { NextApiRequest, NextApiResponse } from 'next'
+import { stripe } from '../../../lib/stripe'
+import { prisma } from '../../../lib/prisma'
+
+export const config = { api: { bodyParser: false } }
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const sig = req.headers['stripe-signature'] as string
+  const buf = await buffer(req)
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || ''
+  let event
+  try {
+    event = stripe.webhooks.constructEvent(buf.toString(), sig, webhookSecret)
+  } catch (err) {
+    console.error('Webhook signature verification failed.')
+    return res.status(400).send(`Webhook Error: ${err}`)
+  }
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      // handle checkout
+      break
+    case 'invoice.payment_succeeded':
+      // update subscription state
+      break
+    case 'customer.subscription.updated':
+      // sync with DB
+      break
+    default:
+      console.log(`Unhandled event type ${event.type}`)
+  }
+
+  res.json({ received: true })
+}
+```
+
+--- FILE: src/pages/index.tsx
+```tsx
+import Link from 'next/link'
+export default function Home() {
+  return (
+    <main style={{padding: 40}}>
+      <h1>Lovable SaaS — Boilerplate</h1>
+      <p>Minimal starter with NextAuth, Prisma and Stripe.</p>
+      <ul>
+        <li><Link href="/dashboard">Dashboard (protected)</Link></li>
+        <li><Link href="/api/auth/signin">Sign in</Link></li>
+      </ul>
+    </main>
+  )
+}
+```
+
+--- FILE: src/pages/dashboard.tsx
+```tsx
+import { getSession } from 'next-auth/react'
+import { prisma } from '../lib/prisma'
+
+export default function Dashboard({ projects }: any) {
+  return (
+    <main style={{padding: 40}}>
+      <h1>Dashboard</h1>
+      <pre>{JSON.stringify(projects, null, 2)}</pre>
+    </main>
+  )
+}
+
+export async function getServerSideProps(ctx: any) {
+  const session = await getSession(ctx)
+  if (!session) return { redirect: { destination: '/api/auth/signin', permanent: false } }
+  // fetch projects for the user tenant (placeholder)
+  const projects = []
+  return { props: { projects } }
+}
+```
+
+--- FILE: prisma/seed.ts
+```ts
+import { prisma } from '../src/lib/prisma'
+import bcrypt from 'bcryptjs'
+
+async function main() {
+  const passwordHash = await bcrypt.hash('password123', 10)
+  const tenant = await prisma.tenant.create({ data: { name: 'Demo Tenant' } })
+  await prisma.user.create({ data: { email: 'owner@example.com', name: 'Owner', tenantId: tenant.id, passwordHash } })
+}
+
+main().catch(e => { console.error(e); process.exit(1) }).finally(async () => { await prisma.$disconnect() })
+```
+
+--- FILE: .github/workflows/deploy.yml
+```yaml
+name: Deploy to Vercel
+on:
+  push:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install
+        run: npm ci
+      - name: Build
+        run: npm run build
+      # you can add Vercel/GitHub deployment action here or use Vercel integration
+```
+
+---
+
+# How to use
+1. Copy files into a new repo.
+2. Create Postgres database and set `DATABASE_URL`.
+3. Run `npm install`.
+4. Run `npx prisma migrate dev --name init` then `npm run seed`.
+5. Start dev server with `npm run dev`.
+
+---
+
+If you want: I can now (A) generate these files as a ZIP, (B) push to a GitHub repo (you give access/token), or (C) expand to App Router + full feature set (webhooks handlers, billing portal links, RLS policies). Which next?  
